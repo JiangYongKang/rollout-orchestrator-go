@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -43,9 +44,13 @@ func newEngine(t *testing.T, dir string) (*Engine, *SimApplier) {
 	return e, sim
 }
 
+// reporterInstance 区分同一计划在“重启”前后的上报器，避免 ReportID 撞已落盘的旧 ID。
+var reporterInstance int64
+
 // startReporter 模拟外部监控周期性上报实际状态。
 func startReporter(t *testing.T, e *Engine, sim *SimApplier, target, planID string) (stop func()) {
 	t.Helper()
+	inst := atomic.AddInt64(&reporterInstance, 1)
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -63,7 +68,7 @@ func startReporter(t *testing.T, e *Engine, sim *SimApplier, target, planID stri
 			if err != nil {
 				continue // 模拟短暂缺失
 			}
-			obs.ReportID = fmt.Sprintf("%s-r%d", planID, i)
+			obs.ReportID = fmt.Sprintf("%s-i%d-r%d", planID, inst, i)
 			if err := e.Report(planID, obs); err != nil &&
 				!errors.Is(err, ErrPlanFinished) && !errors.Is(err, ErrNotFound) {
 				t.Logf("report %s -> %v", obs.ReportID, err)

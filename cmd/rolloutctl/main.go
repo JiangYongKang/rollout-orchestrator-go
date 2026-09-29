@@ -3,13 +3,14 @@
 // 用法：
 //
 //	rolloutctl -store <path> create   -id p1 -target svc -strategy canary -from v1 -to v2 -replicas 10
+//	rolloutctl -store <path> create   -id p2 -target svc -strategy batch -to v2 -replicas 10 -batches 2,3,5
 //	rolloutctl -store <path> get      -id p1
 //	rolloutctl -store <path> advance  -id p1 -cmd c1 [-simulate] [-timeout 10s]
 //	rolloutctl -store <path> pause    -id p1 -cmd c2
 //	rolloutctl -store <path> resume   -id p1 -cmd c3
 //	rolloutctl -store <path> rollback -id p1 -cmd c4
-//	rolloutctl -store <path> report   -id p1 -report-id r1 -replicas 5 -error-rate 0.01
-//	rolloutctl -store <path> demo
+//	rolloutctl -store <path> report   -id p1 -report-id r1 -version v2 -traffic 50 -replicas 5 -error-rate 0.01
+//	rolloutctl -store <path> demo [-strategy batch]
 //
 // 说明：单进程内通过 -simulate 由内置模拟环境持续上报实际状态；
 // 跨进程场景请用 report 子命令上报观测（按 ReportID 幂等）。
@@ -22,6 +23,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/highcumontoa/rollout-orchestrator-go/internal/rollout"
@@ -50,6 +53,8 @@ func fatal(err error) {
 	case errors.Is(err, rollout.ErrStoreVersion),
 		errors.Is(err, rollout.ErrStoreCorrupt):
 		code = 6
+	case errors.Is(err, rollout.ErrTargetBusy):
+		code = 7
 	default:
 		code = 1
 	}
@@ -74,17 +79,31 @@ func main() {
 	id := fs.String("id", "", "计划 ID")
 	cmdID := fs.String("cmd", "", "命令 ID（幂等）")
 	target := fs.String("target", "", "目标名称")
-	strategy := fs.String("strategy", "canary", "策略: canary|bluegreen")
+	strategy := fs.String("strategy", "canary", "策略: canary|bluegreen|batch")
 	from := fs.String("from", "v1", "当前稳定版本")
 	to := fs.String("to", "v2", "目标版本")
-	replicas := fs.Int("replicas", 10, "总副本数")
+	replicas := fs.Int("replicas", 10, "总副本数（目标承载上限）")
+	batches := fs.String("batches", "", "batch 策略每批新增副本数，逗号分隔，如 2,3,5（批次数量与每批副本数）")
 	reportID := fs.String("report-id", "", "上报 ID（幂等）")
+	version := fs.String("version", "v2", "观测到的实际生效版本")
+	traffic := fs.Int("traffic", 0, "观测到的新版本流量占比（百分比）")
 	errRate := fs.Float64("error-rate", 0, "观测错误率")
 	samples := fs.Int("samples", 100, "样本数")
 	simulate := fs.Bool("simulate", false, "用内置模拟环境驱动收敛上报")
 	timeout := fs.Duration("timeout", 10*time.Second, "推进等待超时")
 	if err := fs.Parse(rest); err != nil {
 		fatal(err)
+	}
+
+	var batchSizes []int
+	if *batches != "" {
+		for _, s := range strings.Split(*batches, ",") {
+			n, err := strconv.Atoi(strings.TrimSpace(s))
+			if err != nil {
+				fatal(fmt.Errorf("%w: bad -batches entry %q", rollout.ErrInvalidArgument, s))
+			}
+			batchSizes = append(batchSizes, n)
+		}
 	}
 
 	sim := rollout.NewSimApplier()
@@ -100,6 +119,7 @@ func main() {
 		p, err := eng.Create(*cmdID, rollout.Plan{
 			ID: *id, Target: *target, Strategy: rollout.StrategyKind(*strategy),
 			FromVersion: *from, ToVersion: *to, TotalReplicas: *replicas,
+			BatchSizes: batchSizes,
 			Health: rollout.HealthPolicy{
 				MaxErrorRate: 0.05, FailureBudget: 3,
 				ObservationMaxAge: time.Minute, MinSamples: 10,
@@ -152,6 +172,7 @@ func main() {
 		}
 		err = eng.Report(*id, rollout.Observation{
 			ReportID: *reportID, ReportedAt: time.Now(),
+			EffectiveVersion: *version, TrafficPercent: *traffic,
 			Replicas: *replicas, ErrorRate: *errRate,
 			Samples: *samples, HasMetrics: true,
 		})
@@ -160,7 +181,7 @@ func main() {
 		}
 		fmt.Printf("report accepted for plan %s (state=%s step=%d)\n", p.ID, p.State, p.CurrentStep)
 	case "demo":
-		if err := demo(eng, sim); err != nil {
+		if err := demo(eng, sim, rollout.StrategyKind(*strategy), *replicas, batchSizes); err != nil {
 			fatal(err)
 		}
 	default:
@@ -196,11 +217,12 @@ func startSimReporter(eng *rollout.Engine, sim *rollout.SimApplier, planID strin
 	return func() { close(done) }
 }
 
-// demo 完整演示：创建金丝雀计划并逐步推进到成功。
-func demo(eng *rollout.Engine, sim *rollout.SimApplier) error {
+// demo 完整演示：按指定策略创建计划并逐步推进到成功。
+func demo(eng *rollout.Engine, sim *rollout.SimApplier, kind rollout.StrategyKind, total int, batches []int) error {
 	p, err := eng.Create("demo-create", rollout.Plan{
-		ID: "demo", Target: "svc-demo", Strategy: rollout.StrategyCanary,
-		FromVersion: "v1", ToVersion: "v2", TotalReplicas: 10,
+		ID: "demo", Target: "svc-demo", Strategy: kind,
+		FromVersion: "v1", ToVersion: "v2", TotalReplicas: total,
+		BatchSizes: batches,
 		Health: rollout.HealthPolicy{
 			MaxErrorRate: 0.05, FailureBudget: 3,
 			ObservationMaxAge: time.Minute, MinSamples: 10,
@@ -209,7 +231,11 @@ func demo(eng *rollout.Engine, sim *rollout.SimApplier) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("created plan demo: %d steps\n", len(p.Steps))
+	fmt.Printf("created plan demo (strategy=%s): %d steps: ", kind, len(p.Steps))
+	for _, s := range p.Steps {
+		fmt.Printf("[%s r=%d %d%%] ", s.Name, s.Replicas, s.Percent)
+	}
+	fmt.Println()
 	stop := startSimReporter(eng, sim, p.ID)
 	defer stop()
 	for i := range p.Steps {

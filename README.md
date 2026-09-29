@@ -5,91 +5,176 @@
 
 ## 发布策略语义
 
-两种策略共享同一套状态机与阶段语义（应用期望状态 → 等待收敛 → 健康门控 → 进入下一阶段）：
+三种策略共享同一套状态机、同一套阶段位点与恢复规则
+（应用期望状态 → 等待多维门控收敛 → 进入下一阶段）：
 
 | 策略 | 阶段序列 | 语义 |
 | --- | --- | --- |
-| `canary` | 10% → 50% → 100% | 逐批扩大新版本副本数与流量，每批都需收敛且通过健康门控 |
+| `canary` | 10% → 50% → 100% | 逐批扩大新版本副本数与流量，每批都需收敛且通过多维门控 |
 | `bluegreen` | deploy-green(0% 流量, 全量副本) → switch-traffic(100%) | 先全量部署 green 但不接流量，观测通过后一次性切换 |
+| `batch` | 由 `-batches` / `BatchSizes` 配置 | **按固定副本数分批**：每批新增固定数量新版本副本 |
+
+### batch（固定副本分批）
+
+- 批次数 = `BatchSizes` 数组长度；每个元素是**该批新增**的新版本副本数。
+- 每阶段的期望承载 = 前面各批累计副本数；期望流量占比 = 累计副本 / 总副本数。
+- 例：`-replicas 10 -batches 2,3,5` 产生三批：累计 `2(20%) → 5(50%) → 10(100%)`。
+- 各批总和**允许小于**承载上限（即分批放量不要求最后全量），但**不得超过**。
+- 与 canary/bluegreen 完全共用状态、恢复、暂停/继续/回滚与多维门控；
+  支持查询、暂停、继续、回滚，进程重启后从一致位点继续。
+
+非法配置一律返回 `ErrInvalidArgument`，**不会**凑成默认批次继续跑：
+
+- 批次列表为空（未配置 `-batches`）；
+- 任一批次副本数 ≤ 0；
+- 各批累计副本数超过总副本数（目标承载上限）。
+
+## 多维阶段门控（判定看哪些维度）
+
+一个阶段必须**同时**满足以下维度才算真正完成，缺一不可（结论与逐维度期望值/观测值
+都记录在 `Plan.Verdicts` 供审计）：
+
+1. **生效版本**：观测的 `EffectiveVersion` == 该阶段期望版本（计划的 `ToVersion`）；
+2. **流量占比**：观测的 `TrafficPercent` ≥ 该阶段期望占比；
+3. **实际承载**：观测的 `Replicas` == 该阶段期望副本数（精确收敛，不多不少）；
+4. 健康维度：观测未过期、关键指标齐全、样本数达标、错误率不超阈值。
+
+判定结论代码：`ok` / `stale-observation` / `version-mismatch` / `traffic-not-reached` /
+`replicas-not-converged` / `missing-metric` / `insufficient-samples` / `error-rate-exceeded`。
+
+**严格防误判：**
+
+- 阶段期望状态应用时记录观测水位线 `GateSeq`；**只有该阶段应用之后产生的新观测**
+  （按单调递增、不受环形裁剪影响的观测序号 `Seq` 比较）才能让该阶段通过。
+- 因此**前面阶段的观测不能拿来当后面阶段的通过依据，一次观测也不可能同时让两个阶段
+  通过**；进入新阶段后必须等到新上报。
+- 实际状态延迟、抖动或短暂未上报时，只判“尚未收敛”并继续等待，**不提前放行、不跳过
+  阶段、不改写结论**。
+- 只有“观测已在当前阶段产生、且内容表明新版本本身不健康”（指标缺失 / 样本不足 /
+  错误率超标）才计入失败预算；连续达到 `FailureBudget` 自动回滚。收敛慢不算发布失败。
 
 ## 状态模型
 
 ```
 Pending(隐含) → Running ⇄ Paused
 Running → RollingBack → RolledBack   (手动或健康门控自动触发)
-Running → Succeeded                  (最后一个阶段收敛且健康)
 Running/RollingBack → Failed         (副作用重试耗尽)
 ```
 
+阶段位点（三种策略共用，用于无重复放量与断点恢复）：
+
+- `CurrentStep`：最后一个**已通过门控**的阶段下标（-1 表示尚无阶段通过）；
+- `PendingStep`：已应用期望、正在等待门控的阶段下标（-1 无在途阶段）；
+- `GateSeq`：在途阶段认可的最早观测序号（新观测水位线）。
+
+只有没有在途阶段时才会真正应用下一批期望，所以重复调用、超时重试、进程重启都不会
+重复放量或跳过阶段。
+
 - 终态：`Succeeded` / `RolledBack` / `Failed`。对终态计划的任何操作返回 `ErrPlanFinished`。
 - 非法迁移（如 Paused 时 Advance、重复 Pause）返回 `ErrInvalidTransition`。
-- 每个变更命令携带 `cmdID`，重复命令返回 `ErrDuplicateCommand`，不会产生重复副作用。
+- 每个变更命令携带 `cmdID`，命令在门控通过那一刻入账；重复命令返回
+  `ErrDuplicateCommand`，不产生重复副作用。超时/重启后用同一 `cmdID` 继续等待在途
+  阶段是允许的（此时副作用早已应用，不会重复）。
 
-## 收敛与上报幂等
+## 同一目标互斥规则
 
-- `Advance` 应用期望副本数后，等待最新观测显示实际副本数等于期望值且健康判定通过。
-- 实际状态由 `SimApplier` 模拟：逐步收敛（延迟）、可注入抖动、指标缺失与短暂目标缺失。
-- 观测按 `ReportID` 幂等去重：重复上报返回 `ErrDuplicateReport`，观测计数不变，
-  不会造成重复放量、跳过阶段或结论漂移。
+- **同一目标同一时刻只允许有一个进行中（非终态）的发布**；在它成功 / 回滚 / 失败前，
+  对该目标再创建发布一律返回 `ErrTargetBusy`（CLI 退出码 7），与参数错误
+  （`ErrInvalidArgument`）、非法状态（`ErrInvalidTransition`）等原因明确区分。
+- 同一目标上的**创建 / 推进 / 暂停 / 回滚按目标互斥锁串行**（加锁顺序：目标锁 →
+  计划锁），不会重复放量、半更新或状态跳级；**不同目标之间并行、互不影响**。
+- 进行中计划集合随存储持久化，**进程重启后同一目标的互斥约束照样生效**。
+- 计划到达终态后释放目标，之后允许在该目标上新建发布。
 
-## 健康门控与自动回滚
+## 收敛、上报与有界状态
 
-判定规则（任一不满足即不健康，不得推进，全部记录到 `Plan.Verdicts` 供审计）：
+- `Advance` 应用期望副本数/流量后，等待一条满足全部维度的**新观测**。
+- 实际状态由 `SimApplier` 模拟：承载逐步收敛（延迟）、流量占比即时生效，
+  可注入抖动、指标缺失与短暂目标缺失。
+- 观测按 `ReportID` 幂等去重：重复上报返回 `ErrDuplicateReport`，计数不变。
+- 观测、已见上报 ID、已应用命令 ID 均按 `MaxObservations` 环形裁剪；判定审计封顶
+  `verdictCap=1000`。**长期运行批次数不会增多、状态记录不会无限膨胀。**
+- 落盘采用去抖合并：高频上报只更新内存并由单个刷盘协程周期性原子写，状态迁移 /
+  位点变更 / 终态 / 关闭仍同步落盘，恢复语义不变。
 
-1. 无观测或观测超过 `ObservationMaxAge` → `stale-observation`
-2. 关键指标缺失（`HasMetrics=false`）→ `missing-metric`
-3. 样本数低于 `MinSamples` → `insufficient-samples`
-4. 错误率超过 `MaxErrorRate` → `error-rate-exceeded`
+## 持久化、断点恢复与旧数据兼容
 
-连续不健康次数达到 `FailureBudget` 后自动回滚到上一个稳定版本
-（`FromVersion`，新版本副本归零），计划进入 `RolledBack`，判定依据保留在 `Verdicts` 中。
-
-## 持久化与断点恢复
-
-- 单文件 JSON 存储，写盘采用临时文件 + rename 原子替换。
-- 文件含 `version` 模式版本：版本不匹配返回 `ErrStoreVersion`，JSON 损坏返回
-  `ErrStoreCorrupt`，绝不按默认值静默解释旧数据。
-- 副作用（`Apply`）幂等：崩溃发生在“已应用未落盘”窗口时，重启后重放同一期望状态是安全的。
+- 单文件 JSON 存储（当前模式版本 **v2**），写盘采用临时文件 + rename 原子替换。
+- JSON 损坏返回 `ErrStoreCorrupt`。
+- **兼容范围（不静默按缺省值解释）：**
+  - **v2**：当前格式，直接读取；
+  - **v1**（旧：观测无版本/流量维度、位点只有单个 `currentStep`）：**可读取并迁移**，
+    位点按下述确定性规则映射，随后继续推进的门控结论与新格式一致：
+    - 进行中：该阶段视为“在途”，重新等待多维门控，且必须使用迁移后产生的**新观测**；
+    - 已暂停：视为停在上一已通过位点，恢复后从下一阶段开始；
+    - 给旧观测回填稳定序号，`NextSeq` 不回退；旧观测缺版本/流量（零值），在多维门控
+      下天然不可能通过（空版本 ≠ 期望版本、0 流量达不到正期望），因此不会被当成功解释。
+  - **其它版本：明确拒绝**并返回 `ErrStoreVersion`，可与损坏/参数错误区分。
+- 副作用（`Apply`）幂等：崩溃发生在“已应用未落盘”窗口时，重启后重放同一期望状态安全；
+  进行中阶段重启后重新等待门控、不重复放量。
 - `RollingBack` 是崩溃可能留下的中间态，重启时幂等重放回滚并落定 `RolledBack`/`Failed`。
 - 命令幂等表（`AppliedCmds`）随计划持久化，重启后重复命令仍被拒绝。
-
-## 并发与资源上限
-
-- 每个计划一把互斥锁串行化变更操作；上报只走引擎锁，不被推进流程阻塞。
-- 无后台常驻协程：`Advance` 通过通知通道等待上报，`Close` 仅落盘，不泄漏协程/句柄。
-- `Limits`：`MaxPlans`（计划数上限）、`MaxRetries`（副作用重试上限，超限进入 `Failed`）、
-  `MaxObservations`（观测/上报 ID 环形上限，防内存膨胀）；判定审计封顶 1000 条。
 
 ## 错误分类（CLI 退出码）
 
 | 退出码 | 含义 |
 | --- | --- |
-| 2 | 参数错误 / 计划不存在 |
+| 2 | 参数错误（含 batch 非法配置） / 计划不存在 |
 | 3 | 非法迁移 / 终态操作 / 重复命令 / 重复上报 |
-| 4 | 健康门控拒绝 / 观测过期 / 指标缺失 / 未收敛 |
+| 4 | 健康门控拒绝 / 观测过期 / 版本或流量不符 / 承载未收敛 |
 | 5 | 重试耗尽 / 资源超限 |
 | 6 | 存储版本不兼容 / 数据损坏 |
+| 7 | **同一目标已有进行中发布（`ErrTargetBusy`）** |
 
 ## 本地验证
 
 ```bash
-# 运行全部测试（异常与边界链路为主，含 -race）
-go test -race ./...
+# 运行全部测试（异常与边界链路为主，含竞态检测，可多轮）
+go test -race -count=2 ./...
+go test -v ./...          # 日志打印每条用例的输入、状态变化与逐维度判定依据
 
-# CLI 全链路
 go build -o /tmp/rolloutctl ./cmd/rolloutctl
-cd /tmp && rm -f st.json
-./rolloutctl -store st.json create  -id p1 -target svc-a -strategy canary -cmd c1
-./rolloutctl -store st.json advance -id p1 -cmd a1 -simulate   # 模拟环境驱动收敛
-./rolloutctl -store st.json pause   -id p1 -cmd p1
-./rolloutctl -store st.json advance -id p1 -cmd a2             # 退出码 3：Paused 不可推进
-./rolloutctl -store st.json resume  -id p1 -cmd r1
-./rolloutctl -store st.json advance -id p1 -cmd a2 -simulate
-./rolloutctl -store st.json advance -id p1 -cmd a3 -simulate   # -> Succeeded
-./rolloutctl -store st.json get     -id p1                     # 查看判定依据 verdicts
-./rolloutctl -store st.json demo                               # 一键演示完整金丝雀流程
+
+# 固定副本分批：非法配置必须被拒
+/tmp/rolloutctl -store /tmp/c.json create -id b1 -target svcX -strategy batch \
+  -to v2 -replicas 10 -batches 4,4,4 -cmd x        # exit=2，累计 12 > 10
+
+# 合法分批 + 模拟推进三批
+/tmp/rolloutctl -store /tmp/c.json create -id b1 -target svcX -strategy batch \
+  -to v2 -replicas 10 -batches 2,3,5 -cmd c1
+/tmp/rolloutctl -store /tmp/c.json create -id b2 -target svcX -strategy canary -cmd c2  # exit=7 目标忙
+for i in 0 1 2; do /tmp/rolloutctl -store /tmp/c.json advance -id b1 -cmd a$i -simulate; done
+/tmp/rolloutctl -store /tmp/c.json get -id b1     # 查看 verdicts 逐维度判定依据
+
+# 多维门控：版本不对不放行，全对才放行
+/tmp/rolloutctl -store /tmp/m.json create -id m1 -target svcM -strategy canary -cmd c1
+/tmp/rolloutctl -store /tmp/m.json report -id m1 -report-id r1 -version v9 -traffic 10 -replicas 1
+/tmp/rolloutctl -store /tmp/m.json advance -id m1 -cmd a1 -timeout 400ms   # exit=4 版本不符
+/tmp/rolloutctl -store /tmp/m.json report -id m1 -report-id r2 -version v2 -traffic 10 -replicas 1
+/tmp/rolloutctl -store /tmp/m.json advance -id m1 -cmd a2                  # 通过
+
+# 一键演示固定副本分批完整流程
+/tmp/rolloutctl -store /tmp/d.json demo -strategy batch -replicas 10 -batches 2,3,5
 ```
 
-测试覆盖：非法状态迁移、重复命令/上报、观测过期、指标缺失、健康门控自动回滚、
-重试耗尽、断点重启恢复、存储版本拒绝、并发竞争（`-race`）、资源上限。
-单测日志（`go test -v`）打印输入、状态迁移与判定依据。
+### 新增/增强的自动化测试
+
+| 测试 | 覆盖点 |
+| --- | --- |
+| `TestBatchHappyPath` / `TestBatchPartialCapacity` | 分批正常链路、累计副本/流量推导、允许小于上限 |
+| `TestBatchInvalidConfig` | 空批次、非正副本数、累计超上限、零承载 → `ErrInvalidArgument` 且不落库 |
+| `TestBatchPauseResumeRollback` | 分批方式的暂停/继续/回滚 |
+| `TestBatchRestartRecovery` | 分批推进中途重启，位点一致、不重复放量、命令幂等跨重启 |
+| `TestBatchBoundedGrowth` | 长期高频上报下批次不增多、观测/命令/审计有界 |
+| `TestGateDimensionsIndependent` | 版本/流量/承载三维度逐一不匹配均阻塞，全对才通过 |
+| `TestGateOneObservationCannotPassTwoSteps` | 旧观测不能跨阶段、一次观测不能连过两阶段 |
+| `TestGateJitterDoesNotPass` | 承载抖动时不提前放行 |
+| `TestTargetBusyRejectsSecondPlan` / `TestTargetBusyConcurrentCreate` | 同目标互斥、拒绝原因可区分、并发恰好一个成功 |
+| `TestSameTargetOpsSerialNoDoubleRollout` | 同目标并发推进串行、不重复放量/不跳级 |
+| `TestDifferentTargetsParallel` | 不同目标并行互不影响 |
+| `TestTargetBusySurvivesRestart` | 互斥约束进程重启后仍生效 |
+| `TestLoadV1RunningMigrated` / `TestLoadV1PausedMigrated` / `TestUnsupportedVersionRejected` | v1 可读迁移、需新观测、其它版本明确拒绝 |
+
+原有用例（非法迁移、重复命令/上报、观测过期、指标缺失、健康门控自动回滚、重试耗尽、
+断点恢复、存储版本拒绝、并发竞争、资源上限、蓝绿语义）全部保留并在新门控下持续通过。
+所有测试均为本地内存 + 临时文件 + 模拟环境，不依赖外部服务、真实凭据或网络。

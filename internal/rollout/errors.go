@@ -18,4 +18,5 @@ var (
 	ErrLimitExceeded     = errors.New("resource limit exceeded")
 	ErrRetryExhausted    = errors.New("retry budget exhausted")
 	ErrInvalidArgument   = errors.New("invalid argument")
+	ErrTargetBusy        = errors.New("target already has an active rollout")
 )
