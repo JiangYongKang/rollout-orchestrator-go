@@ -8,15 +8,17 @@ import (
 
 // Applier 将期望状态应用到（模拟的）目标环境。
 type Applier interface {
-	// Apply 设置目标的新版本副本数，可能瞬时失败（调用方需有界重试）。
-	Apply(target string, version string, replicas int) error
+	// Apply 设置目标上指定版本的期望副本数与期望流量占比，可能瞬时失败（调用方需有界重试）。
+	Apply(target string, version string, replicas int, trafficPercent int) error
 }
 
 // simTarget 模拟环境的单目标内部状态。
 type simTarget struct {
-	version string
-	desired int
-	actual  int
+	version        string
+	desired        int
+	actual         int
+	desiredTraffic int
+	actualTraffic  int
 }
 
 // SimApplier 本地模拟实现：实际状态向期望状态渐进收敛，
@@ -40,8 +42,8 @@ func NewSimApplier() *SimApplier {
 	return &SimApplier{targets: map[string]*simTarget{}, StepReplicas: 1}
 }
 
-// Apply 实现 Applier：记录期望状态，实际状态随后经 Observe 逐步收敛。
-func (s *SimApplier) Apply(target string, version string, replicas int) error {
+// Apply 实现 Applier：记录期望副本数与期望流量，实际状态随后经 Observe 逐步收敛。
+func (s *SimApplier) Apply(target string, version string, replicas int, trafficPercent int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.Failures > 0 {
@@ -56,10 +58,31 @@ func (s *SimApplier) Apply(target string, version string, replicas int) error {
 	// 幂等：相同期望状态重复 Apply 不产生额外副作用。
 	t.version = version
 	t.desired = replicas
+	t.desiredTraffic = trafficPercent
 	return nil
 }
 
-// Observe 生成一次实际状态观测：实际值向期望值收敛一步，可叠加抖动/缺失。
+// converge 辅助：actual 向 desired 按步长收敛。
+func converge(actual, desired, step int) int {
+	if step <= 0 {
+		return desired
+	}
+	if actual < desired {
+		actual += step
+		if actual > desired {
+			actual = desired
+		}
+	} else if actual > desired {
+		actual -= step
+		if actual < desired {
+			actual = desired
+		}
+	}
+	return actual
+}
+
+// Observe 生成一次实际状态观测：副本与流量分别向期望值收敛一步，可叠加抖动/缺失。
+// 返回观测三维判定输入：生效版本（新版本副本>0 即视为新版本已生效）、流量占比、实际副本数。
 func (s *SimApplier) Observe(target string) (Observation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -71,18 +94,21 @@ func (s *SimApplier) Observe(target string) (Observation, error) {
 	if t == nil {
 		return Observation{}, fmt.Errorf("%w: target %q", ErrNotFound, target)
 	}
-	step := s.StepReplicas
-	if step <= 0 {
-		t.actual = t.desired
-	} else if t.actual < t.desired {
-		t.actual += step
-		if t.actual > t.desired {
-			t.actual = t.desired
+	t.actual = converge(t.actual, t.desired, s.StepReplicas)
+	// 流量按相对差距的约一半收敛（至少 1 个百分点），与副本收敛耗时相当。
+	diff := t.desiredTraffic - t.actualTraffic
+	if diff != 0 {
+		d := diff / 2
+		if d == 0 {
+			if diff > 0 {
+				d = 1
+			} else {
+				d = -1
+			}
 		}
-	} else if t.actual > t.desired {
-		t.actual -= step
-		if t.actual < t.desired {
-			t.actual = t.desired
+		t.actualTraffic += d
+		if (diff > 0 && t.actualTraffic > t.desiredTraffic) || (diff < 0 && t.actualTraffic < t.desiredTraffic) {
+			t.actualTraffic = t.desiredTraffic
 		}
 	}
 	actual := t.actual
@@ -92,11 +118,20 @@ func (s *SimApplier) Observe(target string) (Observation, error) {
 			actual = 0
 		}
 	}
+	// 新版本副本为 0 时（如回滚到 FromVersion），生效版本上报旧版本。
+	active := t.version
+	if t.actual == 0 {
+		active = ""
+	}
 	return Observation{
-		ReportedAt: time.Now(),
-		Replicas:   actual,
-		ErrorRate:  s.ErrorRate,
-		Samples:    100,
-		HasMetrics: !s.DropMetrics,
+		ReportedAt:     time.Now(),
+		Replicas:       actual,
+		ActiveVersion:  active,
+		HasVersion:     true,
+		TrafficPercent: t.actualTraffic,
+		HasTraffic:     true,
+		ErrorRate:      s.ErrorRate,
+		Samples:        100,
+		HasMetrics:     !s.DropMetrics,
 	}, nil
 }

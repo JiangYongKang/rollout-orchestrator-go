@@ -18,4 +18,6 @@ var (
 	ErrLimitExceeded     = errors.New("resource limit exceeded")
 	ErrRetryExhausted    = errors.New("retry budget exhausted")
 	ErrInvalidArgument   = errors.New("invalid argument")
+	// ErrTargetBusy 同一目标已有进行中的发布，与参数错误、非法状态迁移相区分。
+	ErrTargetBusy = errors.New("target has an active rollout")
 )
