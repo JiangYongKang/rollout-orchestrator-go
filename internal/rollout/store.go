@@ -88,7 +88,9 @@ func (s *FileStore) Load() ([]*Plan, error) {
 // v1 的 CurrentStep 是“当前所处阶段”，无法区分该阶段是“已通过”还是“已应用待门控”。
 // 为绝不提前放行、绝不跳过阶段，迁移采取保守策略：
 //   - 进行中（Running）：视为该阶段在途（PendingStep=CurrentStep），重新等待
-//     多维门控且需要迁移后产生的新观测（GateSeq=已有观测数）；副作用幂等不重放；
+//     多维门控且需要迁移后产生的新观测（GateSeq=已有观测数）；下发确认位
+//     PendingApplied 置 false，由引擎重启恢复逻辑幂等补发一次该批期望
+//     （Apply 幂等，旧数据若实际已下发，补发同一期望也不重复放量）；
 //   - 已暂停（Paused）：视为已停在已通过位点（CurrentStep-1，无在途阶段），
 //     Resume 后从下一阶段开始；
 //   - 终态 / 回滚中间态：无在途阶段，由引擎恢复逻辑落定。
@@ -108,17 +110,21 @@ func migratePlanV1toV2(p *Plan) {
 			// 在途阶段只接受迁移后新产生的观测（水位线 = 已见条数），
 			// 旧观测在多维门控下也不可能通过（见函数末尾说明）。
 			p.GateSeq = p.NextSeq
+			// v1 无下发确认位：保守视为“下发未确认”，引擎恢复时幂等补发一次。
+			p.PendingApplied = false
 			p.CurrentStep--
 		} else {
 			p.PendingStep = -1
 		}
 	case StatePaused:
 		p.PendingStep = -1
+		p.PendingApplied = false
 		if p.CurrentStep >= 0 {
 			p.CurrentStep--
 		}
 	default:
 		p.PendingStep = -1
+		p.PendingApplied = false
 	}
 	// 旧观测缺版本/流量维度（Go 零值）。它们在多维门控下天然不可能通过：
 	// 空版本 != 期望版本，0 流量达不到正期望占比，因此不会被静默当成功解释。

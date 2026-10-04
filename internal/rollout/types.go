@@ -105,26 +105,31 @@ type Verdict struct {
 
 // Plan 发布计划（持久化实体）。
 type Plan struct {
-	ID            string        `json:"id"`
-	Target        string        `json:"target"`
-	Strategy      StrategyKind  `json:"strategy"`
-	FromVersion   string        `json:"fromVersion"`
-	ToVersion     string        `json:"toVersion"`
-	TotalReplicas int           `json:"totalReplicas"`
-	BatchSizes    []int         `json:"batchSizes,omitempty"` // StrategyBatch：每批新增的新版本副本数
-	Steps         []Step        `json:"steps"`
-	CurrentStep   int           `json:"currentStep"` // 最后一个已通过阶段下标，-1 表示尚无阶段通过
-	PendingStep   int           `json:"pendingStep"` // 已应用期望、等待门控的阶段下标；-1 表示无在途阶段
-	GateSeq       int           `json:"gateSeq"`     // 当前在途阶段要求的最早观测序号（防旧观测跨阶段通过）
-	NextSeq       int           `json:"nextSeq"`     // 下一条观测的序号（单调递增，环形裁剪不影响 GateSeq）
-	State         State         `json:"state"`
-	Health        HealthPolicy  `json:"health"`
-	FailStreak    int           `json:"failStreak"`
-	Observations  []Observation `json:"observations"`
-	SeenReports   []string      `json:"seenReports"` // 已处理的上报 ID（幂等）
-	AppliedCmds   []string      `json:"appliedCmds"` // 已应用的命令 ID（幂等）
-	Verdicts      []Verdict     `json:"verdicts"`    // 判定依据审计
-	UpdatedAt     time.Time     `json:"updatedAt"`
+	ID            string       `json:"id"`
+	Target        string       `json:"target"`
+	Strategy      StrategyKind `json:"strategy"`
+	FromVersion   string       `json:"fromVersion"`
+	ToVersion     string       `json:"toVersion"`
+	TotalReplicas int          `json:"totalReplicas"`
+	BatchSizes    []int        `json:"batchSizes,omitempty"` // StrategyBatch：每批新增的新版本副本数
+	Steps         []Step       `json:"steps"`
+	CurrentStep   int          `json:"currentStep"` // 最后一个已通过阶段下标，-1 表示尚无阶段通过
+	PendingStep   int          `json:"pendingStep"` // 已应用期望、等待门控的阶段下标；-1 表示无在途阶段
+	// PendingApplied 标记在途阶段的期望状态是否已确认成功下发（Apply 成功并已落盘）。
+	// false 表示“已登记在途位点、但下发未确认”：崩溃可能发生在下发之前/之中，
+	// 重启（或同进程超时重入）后必须幂等补发同一期望；true 表示下发已确认，
+	// 重入只等待门控、绝不重复放量。Apply 本身幂等，补发同一期望不产生额外副作用。
+	PendingApplied bool          `json:"pendingApplied"`
+	GateSeq        int           `json:"gateSeq"` // 当前在途阶段要求的最早观测序号（防旧观测跨阶段通过）
+	NextSeq        int           `json:"nextSeq"` // 下一条观测的序号（单调递增，环形裁剪不影响 GateSeq）
+	State          State         `json:"state"`
+	Health         HealthPolicy  `json:"health"`
+	FailStreak     int           `json:"failStreak"`
+	Observations   []Observation `json:"observations"`
+	SeenReports    []string      `json:"seenReports"` // 已处理的上报 ID（幂等）
+	AppliedCmds    []string      `json:"appliedCmds"` // 已应用的命令 ID（幂等）
+	Verdicts       []Verdict     `json:"verdicts"`    // 判定依据审计
+	UpdatedAt      time.Time     `json:"updatedAt"`
 }
 
 // expectedVersion 返回阶段期望生效版本（空版本回落到计划目标版本）。

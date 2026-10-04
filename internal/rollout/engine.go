@@ -44,9 +44,14 @@ type Engine struct {
 }
 
 // NewEngine 创建编排器并从 store 恢复。
-// 恢复规则：RollingBack 是崩溃可能留下的中间态，重启后幂等重放回滚到
-// RolledBack；其余状态（含旧版本数据迁移后的位点）原样恢复，不重复已完成的
-// 副作用（Apply 幂等）。
+// 恢复规则：
+//   - RollingBack 是崩溃可能留下的中间态，重启后幂等重放回滚到 RolledBack；
+//   - Running 且存在“在途但下发未确认”（PendingStep>=0 && !PendingApplied）的阶段时：
+//     崩溃可能发生在该批期望下发之前/之中，重启即幂等补发同一期望，随后照常等待
+//     门控，表现与未中断一致；补发成功置 PendingApplied=true，重试耗尽则 Failed；
+//   - Paused 计划挂着未确认在途时，丢弃该在途位点（保留 CurrentStep），Resume 后
+//     从同一阶段重新应用（Apply 幂等），绝不在暂停状态下擅自放量；
+//   - 其余状态（含旧版本数据迁移后的位点）原样恢复，已确认下发的阶段只等待不重放。
 func NewEngine(store Store, applier Applier, limits Limits) (*Engine, error) {
 	if store == nil || applier == nil {
 		return nil, fmt.Errorf("%w: store and applier are required", ErrInvalidArgument)
@@ -75,15 +80,38 @@ func NewEngine(store Store, applier Applier, limits Limits) (*Engine, error) {
 		stopFl:  make(chan struct{}),
 		flDone:  make(chan struct{}),
 	}
+	var recoveryErr error
 	for _, p := range plans {
-		if p.State == StateRollingBack {
+		switch {
+		case p.State == StateRollingBack:
 			// 崩溃恢复：回滚副作用幂等，重放后落定终态。
 			if err := e.applyWithRetry(p.Target, p.FromVersion, 0, 0); err != nil {
 				p.State = StateFailed
+				recoveryErr = fmt.Errorf("%w: recovery rollback plan %s: %v", ErrRetryExhausted, p.ID, err)
 			} else {
 				p.State = StateRolledBack
 			}
 			p.PendingStep = -1
+			p.PendingApplied = false
+			p.UpdatedAt = time.Now()
+		case p.State == StateRunning && p.PendingStep >= 0 && !p.PendingApplied:
+			// 关键恢复：在途阶段的期望状态下发未确认（崩溃在下发前/下发中），
+			// 重启后幂等补发同一批期望，使其与未中断时一样继续等待门控直至成功。
+			// Apply 幂等：若崩溃时其实已下发成功，补发同一期望也不重复放量。
+			step := p.Steps[p.PendingStep]
+			if err := e.applyWithRetry(p.Target, p.expectedVersion(step), step.Replicas, step.Percent); err != nil {
+				p.State = StateFailed
+				p.UpdatedAt = time.Now()
+				recoveryErr = fmt.Errorf("%w: recovery replay plan %s step %d: %v", ErrRetryExhausted, p.ID, p.PendingStep, err)
+			} else {
+				p.PendingApplied = true
+				p.UpdatedAt = time.Now()
+			}
+		case p.State == StatePaused && p.PendingStep >= 0 && !p.PendingApplied:
+			// 暂停中的计划不应在重启时被自动放量：丢弃未确认在途位点，Resume 后
+			// Advance 会对同一阶段重新走“登记 -> 下发 -> 等待”（Apply 幂等）。
+			p.PendingStep = -1
+			p.PendingApplied = false
 			p.UpdatedAt = time.Now()
 		}
 		e.plans[p.ID] = p
@@ -95,8 +123,13 @@ func NewEngine(store Store, applier Applier, limits Limits) (*Engine, error) {
 		}
 		e.notify[p.ID] = make(chan struct{}, 1)
 	}
+	// 即使恢复补发失败也要先把 Failed 位点落盘，再把错误返回给调用方（可与
+	// 参数非法、状态非法、目标占用等原因区分），避免静默“看似恢复成功”。
 	if err := e.store.SaveAll(e.snapshotLocked()); err != nil {
 		return nil, err
+	}
+	if recoveryErr != nil {
+		return nil, recoveryErr
 	}
 	go e.flusher()
 	return e, nil
@@ -274,6 +307,7 @@ func (e *Engine) Create(cmdID string, p Plan) (*Plan, error) {
 	p.Steps = steps
 	p.CurrentStep = -1 // 尚无阶段通过门控
 	p.PendingStep = -1 // 无在途阶段
+	p.PendingApplied = false
 	p.GateSeq = 0
 	p.State = StateRunning
 	p.AppliedCmds = []string{cmdID}
@@ -348,45 +382,68 @@ func (e *Engine) Advance(ctx context.Context, cmdID, id string) (*Plan, error) {
 	}
 	step := p.Steps[next]
 	inFlight := p.PendingStep == next
+	applied := inFlight && p.PendingApplied
 
-	if !inFlight {
+	if !applied {
+		// 需要实际下发的两种情况：
+		//  1. 新阶段（无在途）：登记位点后下发；
+		//  2. 在途但下发未确认（ctx 超时/崩溃/重启后重入，或 NewEngine 恢复时
+		//     尚未补发成功）：幂等补发同一期望，绝不因为“在途”就跳过下发而卡死。
+		// 两种情况复用同一 cmdID 去重规则。
 		if err := checkCmd(p, cmdID); err != nil {
 			e.mu.Unlock()
 			return nil, err
 		}
-		// 先登记在途位点与观测水位线并同步落盘：只有此后产生的观测才能让该阶段
-		// 通过，前面阶段遗留观测不能复用，一次观测也不可能连过两个阶段；
-		// 即使下一步崩溃，恢复后也知道有在途阶段而不会跳过或重复放量。
-		p.PendingStep = next
-		p.GateSeq = p.NextSeq
-		p.UpdatedAt = time.Now()
-		if err := e.persistLocked(); err != nil {
-			e.mu.Unlock()
-			return nil, err
+		if !inFlight {
+			// 先登记在途位点与观测水位线并同步落盘：只有此后产生的观测才能让该阶段
+			// 通过，前面阶段遗留观测不能复用，一次观测也不可能连过两个阶段；
+			// 即使下一步崩溃，恢复后也知道有在途阶段而不会跳过阶段。
+			// 此时 PendingApplied=false：崩溃发生在下发前/下发中时，重启会补发。
+			p.PendingStep = next
+			p.PendingApplied = false
+			p.GateSeq = p.NextSeq
+			p.UpdatedAt = time.Now()
+			if err := e.persistLocked(); err != nil {
+				e.mu.Unlock()
+				return nil, err
+			}
 		}
 		e.mu.Unlock()
 
-		// 应用期望状态（幂等，崩溃后重放安全）。
+		// 应用期望状态。Apply 幂等：重放/补发同一期望安全，不会对同一批重复放量；
+		// 若崩溃时下发其实已生效，重复下发的也是完全相同的期望，目标实际状态不变。
 		if err := e.applyWithRetry(p.Target, p.expectedVersion(step), step.Replicas, step.Percent); err != nil {
 			e.mu.Lock()
 			p.State = StateFailed
+			p.PendingStep = -1
+			p.PendingApplied = false
 			p.UpdatedAt = time.Now()
 			_ = e.persistLocked()
 			e.mu.Unlock()
 			return nil, err
 		}
-	} else {
-		// 恢复在途阶段（上次 ctx 超时/崩溃后重入）：副作用上次已应用，不重复 Apply；
-		// 同一 cmdID 允许继续等待（命令在门控通过那一刻才入幂等账），新 cmdID 需唯一。
-		if cmdID == "" {
+		// 下发成功后同步落盘“已确认”标记：此后重入/重启只等待门控、不再补发，
+		// 保证不会重复放量、也不会多走阶段（位点仍指向同一个 next）。
+		e.mu.Lock()
+		p.PendingApplied = true
+		p.UpdatedAt = time.Now()
+		if err := e.persistLocked(); err != nil {
+			// 落盘失败：保守落 Failed 并清在途（避免下次按未确认无限补发掩盖存储故障）。
+			p.State = StateFailed
+			p.PendingStep = -1
+			p.PendingApplied = false
+			p.UpdatedAt = time.Now()
+			_ = e.persistLocked()
 			e.mu.Unlock()
-			return nil, fmt.Errorf("%w: cmdID required", ErrInvalidArgument)
+			return nil, err
 		}
-		for _, c := range p.AppliedCmds {
-			if c == cmdID {
-				e.mu.Unlock()
-				return nil, fmt.Errorf("%w: %s", ErrDuplicateCommand, cmdID)
-			}
+		e.mu.Unlock()
+	} else {
+		// 已确认下发的在途阶段（上次 ctx 超时/崩溃后重入）：副作用已应用，
+		// 绝不重复 Apply；同一 cmdID 仍按重复命令拒绝，新 cmdID 用于继续等待。
+		if err := checkCmd(p, cmdID); err != nil {
+			e.mu.Unlock()
+			return nil, err
 		}
 		e.mu.Unlock()
 	}
@@ -402,6 +459,7 @@ func (e *Engine) Advance(ctx context.Context, cmdID, id string) (*Plan, error) {
 			p.FailStreak = 0
 			p.CurrentStep = next
 			p.PendingStep = -1
+			p.PendingApplied = false
 			if next == len(p.Steps)-1 {
 				p.State = StateSucceeded
 			}
@@ -431,6 +489,7 @@ func (e *Engine) Advance(ctx context.Context, cmdID, id string) (*Plan, error) {
 					p.State = StateRolledBack
 				}
 				p.PendingStep = -1
+				p.PendingApplied = false
 				p.UpdatedAt = time.Now()
 				_ = e.persistLocked()
 				e.mu.Unlock()
@@ -542,6 +601,7 @@ func (e *Engine) Rollback(cmdID, id string) (*Plan, error) {
 	}
 	p.State = StateRolledBack
 	p.PendingStep = -1
+	p.PendingApplied = false
 	appendCmd(p, cmdID, e.limits.MaxObservations)
 	p.UpdatedAt = time.Now()
 	if err := e.persistLocked(); err != nil {

@@ -65,9 +65,17 @@ Running/RollingBack → Failed         (副作用重试耗尽)
 
 - `CurrentStep`：最后一个**已通过门控**的阶段下标（-1 表示尚无阶段通过）；
 - `PendingStep`：已应用期望、正在等待门控的阶段下标（-1 无在途阶段）；
+- `PendingApplied`：在途阶段的期望状态是否**已确认成功下发并落盘**
+  （false=已登记位点但下发未确认，true=下发已确认）；
 - `GateSeq`：在途阶段认可的最早观测序号（新观测水位线）。
 
-只有没有在途阶段时才会真正应用下一批期望，所以重复调用、超时重试、进程重启都不会
+推进一个阶段严格按三段同步落盘，崩溃只可能停在其中两个窗口，重启都能自愈：
+
+1. **登记**：`PendingStep=n, PendingApplied=false, GateSeq=NextSeq` 同步落盘；
+2. **下发**：对目标 `Apply(version, replicas, percent)`（幂等，有界重试）；
+3. **确认**：下发成功后 `PendingApplied=true` 再次同步落盘，随后才进入门控等待。
+
+只有没有在途阶段时才会进入下一阶段，所以重复调用、超时重试、进程重启都不会
 重复放量或跳过阶段。
 
 - 终态：`Succeeded` / `RolledBack` / `Failed`。对终态计划的任何操作返回 `ErrPlanFinished`。
@@ -110,8 +118,27 @@ Running/RollingBack → Failed         (副作用重试耗尽)
     - 给旧观测回填稳定序号，`NextSeq` 不回退；旧观测缺版本/流量（零值），在多维门控
       下天然不可能通过（空版本 ≠ 期望版本、0 流量达不到正期望），因此不会被当成功解释。
   - **其它版本：明确拒绝**并返回 `ErrStoreVersion`，可与损坏/参数错误区分。
-- 副作用（`Apply`）幂等：崩溃发生在“已应用未落盘”窗口时，重启后重放同一期望状态安全；
+- 副作用（`Apply`）幂等：崩溃发生在“已应用未落盘确认”窗口时，重启后重放同一期望状态安全；
   进行中阶段重启后重新等待门控、不重复放量。
+- **推进中断后的重启恢复（本仓库重点保证）**：进程在一个阶段“刚推进、这批期望还没
+  真正下发出去”时被杀掉，磁盘上只会留下 `PendingStep=n, PendingApplied=false`。
+  重启（`NewEngine`）时按下发确认位决定动作，表现与没中断过一致：
+  - **断在下发之前**（登记后、Apply 前崩溃）：重启自动**补发同一批期望**
+    （相同 version/replicas/percent），随后照常等待门控并一路推进到成功；
+  - **断在下发过程中**（Apply 已返回或副作用可能已落地、确认位未落盘）：重启补发
+    **完全相同**的期望；`Apply` 幂等，目标以该期望为准收敛，不叠加放量、不改乱
+    实际状态或位点记录，也不会因此多走一个阶段（`PendingStep` 始终指向同一阶段）；
+  - **断在下发确认之后**（等待门控期间崩溃）：重启**只重新等待门控，不再下发**；
+  - **不重启、仅超时/取消重入**：未确认则补发同期望，已确认则只等待；同一 `cmdID`
+    在门控通过、命令入账前允许继续等待同一阶段，门控通过后再用即为 `ErrDuplicateCommand`；
+  - **与暂停穿插**：`Paused` 计划挂着未确认在途时重启，**不会在暂停状态下自动放量**，
+    而是丢弃该在途位点（保留 `CurrentStep`），Resume 后对**同一阶段**重新应用并等待；
+  - **与回滚穿插**：`RollingBack` 是崩溃可能留下的中间态，重启幂等重放回滚并落定
+    `RolledBack`（回滚副作用重试耗尽则 `Failed`），回滚断在前/后窗口结论一致。
+  恢复期间的补发/回滚若重试耗尽：计划落 `Failed` 并同步落盘，`NewEngine` 返回
+  包装了 `ErrRetryExhausted` 的错误（CLI 退出码 5），可与参数不合法
+  （`ErrInvalidArgument`）、非法状态（`ErrInvalidTransition`）、目标被占
+  （`ErrTargetBusy`）、存储版本/损坏等原因用 `errors.Is` 明确区分。
 - `RollingBack` 是崩溃可能留下的中间态，重启时幂等重放回滚并落定 `RolledBack`/`Failed`。
 - 命令幂等表（`AppliedCmds`）随计划持久化，重启后重复命令仍被拒绝。
 
@@ -157,7 +184,44 @@ for i in 0 1 2; do /tmp/rolloutctl -store /tmp/c.json advance -id b1 -cmd a$i -s
 /tmp/rolloutctl -store /tmp/d.json demo -strategy batch -replicas 10 -batches 2,3,5
 ```
 
+### 推进中断恢复的本地验证
+
+```bash
+# 只跑中断恢复专项：-v 会打印每个用例的计划输入（各阶段期望签名）、崩溃窗口、
+# 重启后位点、逐维度门控判定（期望/实测版本、流量、副本）与最终下发序列。
+go test -run TestRecovery -v ./...
+
+# 典型输出（断在下发之前 -> 重启自动补发 -> 一路成功）：
+#   === crash window: BEFORE applying step 0 desired state ===
+#   recovered site: state=Running currentStep=-1 pendingStep=0 pendingApplied=true
+#   [drive] cmd=a2 -> state=Running currentStep=1 ... code=ok got(v=v2,t=50,r=5)
+#   [drive] cmd=a3 -> state=Succeeded currentStep=2 ... code=ok got(v=v2,t=100,r=10)
+#   actual application sequence: [...r=2|t=20 ...r=5|t=50 ...r=10|t=100]   # 无重复、无跳阶段
+
+# 全量回归（含竞态），可多轮重复：
+go test -race -count=2 ./...
+```
+
+判定方法：看三条断言性日志——`pendingApplied=true`（重启已自动补发）、
+每阶段 `code=ok` 且 `currentStep` 严格 +1（不跳阶段）、`actual application sequence`
+压缩连续同签名后与阶段序列一一对应（同签名至多相邻重复一次，表示 at-least-once + 幂等）。
+
 ### 新增/增强的自动化测试
+
+中断恢复专项（`recovery_test.go`，均为确定性崩溃注入 + 真实 JSON 落盘/重载，
+无网络、无真实凭据）：
+
+| 测试 | 覆盖点 |
+| --- | --- |
+| `TestRecoveryCrashBeforeApply` | 断在下发**之前**：重启自动补发同一批期望并一路成功；实际下发序列每阶段一次、无重复无跳级 |
+| `TestRecoveryCrashDuringApply` | 断在下发**过程中**（副作用可能已落地）：重启补发同期望、目标精确收敛到该批、最终状态不被改乱 |
+| `TestRecoveryCrashAfterConfirm` | 断在下发**确认之后**的等待期：重启只等待门控、绝不二次下发；同 cmdID 继续等待、不重复放量 |
+| `TestRecoveryTimeoutReentryIdempotent` | 不重启仅超时重入：未确认补发/已确认只等待；cmdID 入账前后语义不同，下一批不被误下发 |
+| `TestRecoveryCrashInterleavedPause` | 与暂停/恢复穿插：暂停态重启不自动放量、丢弃未确认在途，Resume 后从同一阶段重新应用并成功 |
+| `TestRecoveryCrashDuringRollback` | 与回滚穿插（断在回滚前/后两窗口）：重启幂等重放回滚落定 RolledBack，终态操作返回 ErrPlanFinished、目标释放 |
+| `TestRecoveryErrorCausesDistinguishable` | 参数非法 / 非法状态 / 目标占用 / 补发重试耗尽（Failed + ErrRetryExhausted）分别可判定 |
+
+原有用例（异常与边界链路为主）：
 
 | 测试 | 覆盖点 |
 | --- | --- |
