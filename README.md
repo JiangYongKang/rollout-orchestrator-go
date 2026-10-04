@@ -115,6 +115,36 @@ Running/RollingBack → Failed         (副作用重试耗尽)
 - `RollingBack` 是崩溃可能留下的中间态，重启时幂等重放回滚并落定 `RolledBack`/`Failed`。
 - 命令幂等表（`AppliedCmds`）随计划持久化，重启后重复命令仍被拒绝。
 
+### 推进中断后的重启恢复（补发语义）
+
+`Advance` 先把在途位点（`PendingStep`/`GateSeq`）同步落盘，再下发该批期望状态。
+进程可能死在位点落盘之后的任意时点，重启后无法区分下发是否完成：
+
+| 中断时点 | 目标环境状态 | 重启后继续推进的行为 |
+| --- | --- | --- |
+| 断在下发之前 | 从未收到这批期望 | 自动补发同一批期望，再等门控 |
+| 断在下发过程中 | 已收到期望，但引擎不知道结果 | 幂等补发同一批期望（同参数），再等门控 |
+| 断在下发之后 | 期望已生效，门控未通过 | 幂等补发同一批期望（同参数），再等门控 |
+
+恢复规则与保证：
+
+- **自动补齐**：重启后首次继续推进在途阶段时，引擎按持久化的位点重放该阶段期望
+  （`appliedStep` 是纯内存标记，重启即空，因此重启后必然补发一次）；随后正常等待
+  多维门控，一路推进到成功，表现与没中断过一致。
+- **幂等不重复放量**：补发携带与首次完全相同的期望参数（版本/副本/流量），`Apply`
+  幂等，因此目标实际状态与记录不被改乱；位点（`CurrentStep`/`PendingStep`/`GateSeq`）
+  不由补发改动，**不会因此多走或跳过一个阶段**。同一进程内已下发成功的
+  （ctx 超时重入）不会重复 `Apply`。
+- **与暂停/恢复、回滚穿插**：暂停中的在途阶段重启后仍是 `Paused`，`Resume` 后推进
+  时才补发；重启前后都可对同一在途计划回滚，回滚落定 `RolledBack` 后目标释放。
+- **串行与互斥不变**：同一目标的推进/暂停/恢复/回滚仍按目标锁串行，同一目标始终
+  只允许一个进行中的发布（`ErrTargetBusy`），重启前后一致。
+- **结果可区分**：恢复推进的成功结果与参数不合法（`ErrInvalidArgument`）、非法状态
+  （`ErrInvalidTransition`）、目标被占用（`ErrTargetBusy`）、计划不存在
+  （`ErrNotFound`）等拒绝原因各自独立，可用 `errors.Is` 判定。
+- 补发本身重试耗尽（目标环境持续不可用）按副作用失败处理：落 `Failed` 终态，
+  与新阶段下发失败的语义一致。
+
 ## 错误分类（CLI 退出码）
 
 | 退出码 | 含义 |
@@ -155,6 +185,18 @@ for i in 0 1 2; do /tmp/rolloutctl -store /tmp/c.json advance -id b1 -cmd a$i -s
 
 # 一键演示固定副本分批完整流程
 /tmp/rolloutctl -store /tmp/d.json demo -strategy batch -replicas 10 -batches 2,3,5
+
+# 推进中断后重启恢复（每次 CLI 调用都是一个独立进程，天然模拟崩溃重启）：
+# 第一次推进超时退出 = 在途位点已落盘、进程中断；新进程用同一 cmdID 继续推进，
+# 自动幂等补发该批期望并通过门控，随后一路到 Succeeded。
+/tmp/rolloutctl -store /tmp/r.json create -id c1 -target svcC -strategy canary -to v2 -replicas 10 -cmd c1
+/tmp/rolloutctl -store /tmp/r.json advance -id c1 -cmd a0 -timeout 300ms   # exit=4 超时中断，pendingStep=0 已落盘
+/tmp/rolloutctl -store /tmp/r.json advance -id c1 -cmd a0 -simulate        # 重启续推：自动补发，阶段 0 通过
+/tmp/rolloutctl -store /tmp/r.json advance -id c1 -cmd a1 -simulate
+/tmp/rolloutctl -store /tmp/r.json advance -id c1 -cmd a2 -simulate        # Succeeded
+
+# 中断恢复专项单测（日志含输入、状态迁移、逐维度判定依据与每次期望下发参数流水）
+go test -v -run 'TestCrash|TestTimeout' ./internal/rollout/
 ```
 
 ### 新增/增强的自动化测试
@@ -174,6 +216,19 @@ for i in 0 1 2; do /tmp/rolloutctl -store /tmp/c.json advance -id b1 -cmd a$i -s
 | `TestDifferentTargetsParallel` | 不同目标并行互不影响 |
 | `TestTargetBusySurvivesRestart` | 互斥约束进程重启后仍生效 |
 | `TestLoadV1RunningMigrated` / `TestLoadV1PausedMigrated` / `TestUnsupportedVersionRejected` | v1 可读迁移、需新观测、其它版本明确拒绝 |
+| `TestCrashBeforeApplyRecovery` | 断在下发之前：重启后自动补发该批期望并一路成功，补发参数与首次完全一致 |
+| `TestCrashDuringApplyRecovery` | 断在下发过程中（环境已收到期望、引擎不知结果）：幂等补发、实际承载不被改乱 |
+| `TestCrashAfterApplyBeforeGate` | 断在下发之后（门控通过前）：重启重入门控等待，补发幂等、不跳阶段 |
+| `TestTimeoutReentryNoReapply` | 同进程 ctx 超时重入在途阶段：不重复 Apply、不重复放量 |
+| `TestCrashRecoveryWithPauseResume` | 在途阶段暂停后崩溃：重启仍 Paused、推进被拒（ErrInvalidTransition），Resume 后补发推进到成功 |
+| `TestCrashRecoveryWithRollback` | 在途阶段崩溃后回滚：落定 RolledBack、目标释放、终态操作可区分 |
+| `TestCrashRecoveryErrorDistinction` | 恢复推进结果与参数非法/状态非法/目标占用等原因可区分 |
+
+上述中断恢复用例通过 `crashApplier` 在指定期望下发调用点模拟进程被杀
+（可选择该次是否已把期望落到模拟环境），随后用同一存储文件 + 同一模拟环境
+重开引擎验证恢复语义；全部本地运行，不依赖外部服务、真实凭据或网络。
+运行 `go test -v -run 'TestCrash|TestTimeout' ./internal/rollout/` 可在日志中看到
+每条用例的输入、状态迁移、逐维度判定依据与每次期望下发的参数流水。
 
 原有用例（非法迁移、重复命令/上报、观测过期、指标缺失、健康门控自动回滚、重试耗尽、
 断点恢复、存储版本拒绝、并发竞争、资源上限、蓝绿语义）全部保留并在新门控下持续通过。

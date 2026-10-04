@@ -41,6 +41,12 @@ type Engine struct {
 	dirty   bool          // 自上次刷盘后是否有未落盘变更
 	stopFl  chan struct{} // 关闭刷盘协程
 	flDone  chan struct{} // 刷盘协程退出
+	// appliedStep 记录本进程内已完成期望下发的在途阶段（计划 ID -> 阶段下标）。
+	// 纯内存态、不持久化：进程重启后为空，恢复出的在途阶段（PendingStep>=0）在继续
+	// 等待门控前会幂等补发一次期望状态——崩溃可能发生在“位点已落盘、期望未下发/
+	// 下发中途”的窗口，重启后无法区分下发是否完成，而 Apply 幂等，补发与没中断过
+	// 表现一致；本进程内已下发的（ctx 超时重入）不会重复 Apply。
+	appliedStep map[string]int
 }
 
 // NewEngine 创建编排器并从 store 恢复。
@@ -65,15 +71,16 @@ func NewEngine(store Store, applier Applier, limits Limits) (*Engine, error) {
 		return nil, err
 	}
 	e := &Engine{
-		store:   store,
-		applier: applier,
-		limits:  limits,
-		plans:   map[string]*Plan{},
-		pmu:     map[string]*sync.Mutex{},
-		tmu:     map[string]*sync.Mutex{},
-		notify:  map[string]chan struct{}{},
-		stopFl:  make(chan struct{}),
-		flDone:  make(chan struct{}),
+		store:       store,
+		applier:     applier,
+		limits:      limits,
+		plans:       map[string]*Plan{},
+		pmu:         map[string]*sync.Mutex{},
+		tmu:         map[string]*sync.Mutex{},
+		notify:      map[string]chan struct{}{},
+		stopFl:      make(chan struct{}),
+		flDone:      make(chan struct{}),
+		appliedStep: map[string]int{},
 	}
 	for _, p := range plans {
 		if p.State == StateRollingBack {
@@ -315,8 +322,14 @@ func (e *Engine) Get(id string) (*Plan, error) {
 //   - PendingStep：已应用期望、正在等待门控的阶段下标（-1 无在途阶段）；
 //   - GateSeq：在途阶段认可的最早观测序号（应用期望之后产生的新观测水位线）。
 //
-// 只有 PendingStep 无在途时才会真正应用下一批期望并放量，因此重复调用、
+// 只有 PendingStep 无在途时才会登记新阶段位点并放量，因此重复调用、
 // ctx 超时重试、进程重启都不会重复放量或跳过阶段。
+//
+// 中断恢复：崩溃可能发生在“位点已落盘、期望状态未下发/下发中途”的窗口。
+// 重启后引擎无法区分该批期望是否已下发，而 Apply 幂等，因此本进程首次继续
+// 推进在途阶段时会按同一期望状态补发一次（appliedStep 仅内存态，重启即空），
+// 随后正常等待门控——断在下发之前/之中/之后的表现都与没中断过一致；
+// 本进程内已下发的（ctx 超时重入）不会重复 Apply。
 func (e *Engine) Advance(ctx context.Context, cmdID, id string) (*Plan, error) {
 	p, notify, unlock, err := e.lockPlan(id)
 	if err != nil {
@@ -364,19 +377,8 @@ func (e *Engine) Advance(ctx context.Context, cmdID, id string) (*Plan, error) {
 			e.mu.Unlock()
 			return nil, err
 		}
-		e.mu.Unlock()
-
-		// 应用期望状态（幂等，崩溃后重放安全）。
-		if err := e.applyWithRetry(p.Target, p.expectedVersion(step), step.Replicas, step.Percent); err != nil {
-			e.mu.Lock()
-			p.State = StateFailed
-			p.UpdatedAt = time.Now()
-			_ = e.persistLocked()
-			e.mu.Unlock()
-			return nil, err
-		}
 	} else {
-		// 恢复在途阶段（上次 ctx 超时/崩溃后重入）：副作用上次已应用，不重复 Apply；
+		// 恢复在途阶段（上次 ctx 超时/崩溃后重入）：
 		// 同一 cmdID 允许继续等待（命令在门控通过那一刻才入幂等账），新 cmdID 需唯一。
 		if cmdID == "" {
 			e.mu.Unlock()
@@ -388,8 +390,27 @@ func (e *Engine) Advance(ctx context.Context, cmdID, id string) (*Plan, error) {
 				return nil, fmt.Errorf("%w: %s", ErrDuplicateCommand, cmdID)
 			}
 		}
-		e.mu.Unlock()
 	}
+
+	// 确保该阶段期望状态已在本进程下发。崩溃可能发生在“位点已落盘、期望未下发
+	// 或下发中途”的窗口，重启后无法区分下发是否完成；Apply 幂等，因此本进程首次
+	// 推进该在途阶段时补发一次（同一期望状态，不重复放量、不改位点），本进程内
+	// 已下发的（ctx 超时重入）直接跳过。补发失败按副作用失败处理：落 Failed 终态。
+	// 注意必须用 comma-ok 判断：阶段下标 0 与 map 零值相同，不能靠零值区分。
+	if applied, ok := e.appliedStep[p.ID]; !ok || applied != next {
+		e.mu.Unlock()
+		err := e.applyWithRetry(p.Target, p.expectedVersion(step), step.Replicas, step.Percent)
+		e.mu.Lock()
+		if err != nil {
+			p.State = StateFailed
+			p.UpdatedAt = time.Now()
+			_ = e.persistLocked()
+			e.mu.Unlock()
+			return nil, err
+		}
+		e.appliedStep[p.ID] = next
+	}
+	e.mu.Unlock()
 
 	// 等待多维门控：版本、流量、副本承载三者同时收敛，且健康维度通过。
 	for {
@@ -402,6 +423,7 @@ func (e *Engine) Advance(ctx context.Context, cmdID, id string) (*Plan, error) {
 			p.FailStreak = 0
 			p.CurrentStep = next
 			p.PendingStep = -1
+			delete(e.appliedStep, p.ID)
 			if next == len(p.Steps)-1 {
 				p.State = StateSucceeded
 			}
@@ -431,6 +453,7 @@ func (e *Engine) Advance(ctx context.Context, cmdID, id string) (*Plan, error) {
 					p.State = StateRolledBack
 				}
 				p.PendingStep = -1
+				delete(e.appliedStep, p.ID)
 				p.UpdatedAt = time.Now()
 				_ = e.persistLocked()
 				e.mu.Unlock()
@@ -542,6 +565,7 @@ func (e *Engine) Rollback(cmdID, id string) (*Plan, error) {
 	}
 	p.State = StateRolledBack
 	p.PendingStep = -1
+	delete(e.appliedStep, p.ID)
 	appendCmd(p, cmdID, e.limits.MaxObservations)
 	p.UpdatedAt = time.Now()
 	if err := e.persistLocked(); err != nil {
